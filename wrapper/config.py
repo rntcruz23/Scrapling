@@ -34,6 +34,7 @@ class FieldConfig:
     attr: Optional[str] = None      # HTML attribute to read; None → text content
     regex: Optional[str] = None     # Optional regex applied after extraction (first group)
     all: bool = False               # True → getall(); False → get() (first match only)
+    type: Optional[Literal["str", "int", "float"]] = None  # Coerce extracted value
 
 
 @dataclass
@@ -61,6 +62,11 @@ class FetcherOptions:
     http3: bool = False
     proxy: Optional[str] = None
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # Browser-fetcher options (stealth / dynamic only)
+    real_chrome: bool = False       # Use installed Chrome instead of bundled Chromium
+    network_idle: bool = False      # Wait until no network activity for 500 ms
+    block_ads: bool = False         # Block ~3,500 known ad/tracking domains
+    disable_resources: bool = False # Drop images/fonts/media for speed
 
 
 @dataclass
@@ -73,7 +79,7 @@ class RequestOptions:
 @dataclass
 class ScrapeConfig:
     name: str
-    url: str
+    urls: list[str]
     fetcher: Literal["http", "stealth", "dynamic"]
     output: Literal["json", "csv", "stdout"]
     fetcher_options: FetcherOptions
@@ -117,11 +123,16 @@ def _parse_field(name: str, raw: Any, context: str) -> FieldConfig:
     if not isinstance(all_matches, bool):
         raise ConfigError(f"{location}.all: must be true or false")
 
-    unknown = set(raw) - {"selector", "attr", "regex", "all"}
+    type_coerce = raw.get("type")
+    if type_coerce is not None:
+        if type_coerce not in ("str", "int", "float"):
+            raise ConfigError(f"{location}.type: must be 'str', 'int', or 'float'")
+
+    unknown = set(raw) - {"selector", "attr", "regex", "all", "type"}
     if unknown:
         raise ConfigError(f"{location}: unknown key(s): {', '.join(sorted(unknown))}")
 
-    return FieldConfig(selector=selector, attr=attr, regex=regex, all=all_matches)
+    return FieldConfig(selector=selector, attr=attr, regex=regex, all=all_matches, type=type_coerce)
 
 
 def _parse_fields(raw_fields: Any, context: str) -> dict[str, FieldConfig]:
@@ -220,7 +231,16 @@ def _parse_fetcher_options(raw: Any) -> FetcherOptions:
             raise ConfigError("fetcher_options.extra_headers: all keys and values must be strings")
         opts.extra_headers = eh
 
-    unknown = set(raw) - {"impersonate", "http3", "proxy", "extra_headers"}
+    for bool_key in ("real_chrome", "network_idle", "block_ads", "disable_resources"):
+        if bool_key in raw:
+            if not isinstance(raw[bool_key], bool):
+                raise ConfigError(f"fetcher_options.{bool_key}: must be true or false")
+            setattr(opts, bool_key, raw[bool_key])
+
+    unknown = set(raw) - {
+        "impersonate", "http3", "proxy", "extra_headers",
+        "real_chrome", "network_idle", "block_ads", "disable_resources",
+    }
     if unknown:
         raise ConfigError(f"fetcher_options: unknown key(s): {', '.join(sorted(unknown))}")
 
@@ -286,11 +306,31 @@ def load_config(path: str | Path) -> ScrapeConfig:
         raise ConfigError(f"{path}: top-level structure must be a YAML mapping")
 
     # --- required top-level keys ---
-    for key in ("name", "url"):
-        if key not in raw:
-            raise ConfigError(f"Missing required top-level key '{key}'")
-        if not isinstance(raw[key], str) or not raw[key].strip():
-            raise ConfigError(f"'{key}' must be a non-empty string")
+    if "name" not in raw:
+        raise ConfigError("Missing required top-level key 'name'")
+    if not isinstance(raw["name"], str) or not raw["name"].strip():
+        raise ConfigError("'name' must be a non-empty string")
+
+    has_url = "url" in raw
+    has_urls = "urls" in raw
+    if has_url and has_urls:
+        raise ConfigError("Use either 'url' or 'urls', not both")
+    if not has_url and not has_urls:
+        raise ConfigError("Missing required key 'url' (single) or 'urls' (list)")
+
+    if has_url:
+        if not isinstance(raw["url"], str) or not raw["url"].strip():
+            raise ConfigError("'url' must be a non-empty string")
+        urls = [raw["url"].strip()]
+    else:
+        raw_urls = raw["urls"]
+        if not isinstance(raw_urls, list) or not raw_urls:
+            raise ConfigError("'urls' must be a non-empty list")
+        urls = []
+        for i, u in enumerate(raw_urls):
+            if not isinstance(u, str) or not u.strip():
+                raise ConfigError(f"'urls[{i}]' must be a non-empty string")
+            urls.append(u.strip())
 
     fetcher = raw.get("fetcher", "http")
     if fetcher not in FETCHER_TYPES:
@@ -320,7 +360,7 @@ def load_config(path: str | Path) -> ScrapeConfig:
         raise ConfigError("'pagination' requires 'items' to be defined")
 
     known_keys = {
-        "name", "url", "fetcher", "output",
+        "name", "url", "urls", "fetcher", "output",
         "fetcher_options", "request_options",
         "items", "top_level", "pagination",
     }
@@ -330,7 +370,7 @@ def load_config(path: str | Path) -> ScrapeConfig:
 
     return ScrapeConfig(
         name=raw["name"].strip(),
-        url=raw["url"].strip(),
+        urls=urls,
         fetcher=fetcher,
         output=output,
         fetcher_options=fetcher_options,
